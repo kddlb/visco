@@ -14,7 +14,7 @@ pub mod zigzag;
 
 use std::sync::Arc;
 
-use visco_core::{Codec, CodecError, ParamSpec, Params, RgbImage, Trace};
+use visco_core::{Codec, CodecError, Media, MediaKind, ParamSpec, Params, Trace};
 
 use crate::{
     decoder::{DecodeOptions, decode},
@@ -49,6 +49,14 @@ impl Codec for JpegCodec {
         &["jpg", "jpeg", "jpe", "jfif"]
     }
 
+    fn sniff(&self, bytes: &[u8]) -> bool {
+        bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+    }
+
+    fn input_kind(&self) -> MediaKind {
+        MediaKind::Image
+    }
+
     fn params_schema(&self) -> Vec<ParamSpec> {
         vec![
             ParamSpec::Int { key: "quality", label: "Quality", min: 1, max: 100, default: 75 },
@@ -63,7 +71,10 @@ impl Codec for JpegCodec {
         ]
     }
 
-    fn encode(&self, input: &RgbImage, params: &Params) -> Result<Trace, CodecError> {
+    fn encode(&self, input: &Media, params: &Params) -> Result<Trace, CodecError> {
+        let Media::Image(input) = input else {
+            return Err(CodecError("JPEG encodes images, not audio".into()));
+        };
         if input.width == 0 || input.height == 0 || input.width > 65535 || input.height > 65535 {
             return Err(CodecError(format!("JPEG cannot encode a {}×{} image", input.width, input.height)));
         }

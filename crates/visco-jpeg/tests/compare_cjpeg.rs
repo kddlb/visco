@@ -7,7 +7,9 @@ use visco_jpeg::{encoder::{EncodeParams, encode}, sampling::Subsampling};
 fn compare_with_cjpeg() {
     let (w, h) = (77, 45);
     let rgb = synth(w, h);
-    let dir = std::env::var("SCRATCH").unwrap();
+    let dir = std::env::temp_dir().join("visco-jpeg-compare");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.display().to_string();
     let ppm = format!("{dir}/synth.ppm");
     let mut f = format!("P6\n{w} {h}\n255\n").into_bytes();
     f.extend_from_slice(&rgb);

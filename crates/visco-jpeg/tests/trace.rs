@@ -1,7 +1,7 @@
 mod common;
 use common::*;
 use std::sync::Arc;
-use visco_core::{Codec, Params, RgbImage, StageView};
+use visco_core::{Codec, Media, Params, RgbImage, StageView};
 use visco_jpeg::JpegCodec;
 
 fn check(trace: &visco_core::Trace, name: &str) {
@@ -53,7 +53,7 @@ fn decode_traces_for_all_fixtures() {
 #[test]
 fn encode_traces() {
     let (w, h) = (50, 30);
-    let img = RgbImage { width: w, height: h, data: synth(w, h).into() };
+    let img = Media::Image(RgbImage { width: w, height: h, data: synth(w, h).into() });
     let schema = JpegCodec.params_schema();
     for gray in [false, true] {
         for sub in 0..3 {

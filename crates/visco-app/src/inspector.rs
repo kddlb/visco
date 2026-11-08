@@ -9,7 +9,7 @@ use gpui_kit::component::{
 use gpui_kit::*;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
-use visco_core::{DetailGrid, ParamSpec, ParamValue, Ramp, Table};
+use visco_core::{DetailGrid, DetailPlot, ParamSpec, ParamValue, Ramp, Table};
 
 use crate::{
     app::{Mode, Visco},
@@ -26,7 +26,7 @@ pub enum InspectorTab {
 
 pub fn render(this: &mut Visco, cx: &mut Context<Visco>) -> AnyElement {
     let theme = cx.theme().clone();
-    let can_encode = this.source.as_ref().is_some_and(|s| s.rgb.is_some());
+    let can_encode = this.can_encode();
     let mut tabs = h_flex().gap_1().px_2().py_2().border_b_1().border_color(theme.border);
     for (tab, label) in [
         (InspectorTab::Block, "Block"),
@@ -90,6 +90,12 @@ fn block_tab(this: &Visco, theme: &Theme, cx: &mut Context<Visco>) -> impl IntoE
         grids = grids.child(detail_grid(g, theme));
     }
     col = col.child(grids);
+    for p in &info.plots {
+        col = col.child(detail_plot(p, theme));
+    }
+    for t in &info.tables {
+        col = col.child(compact_table(t, theme));
+    }
 
     if let Some(trace) = this.trace() {
         let spans = &info.spans;
@@ -130,10 +136,98 @@ fn block_tab(this: &Visco, theme: &Theme, cx: &mut Context<Visco>) -> impl IntoE
 }
 
 /// The bits of a span as a 0/1 string (capped).
-fn bit_string(bytes: &[u8], start: u64, len: u16) -> String {
+fn bit_string(bytes: &[u8], start: u64, len: u32) -> String {
     (start..start + (len as u64).min(64))
         .map(|b| if (bytes[(b / 8) as usize] >> (7 - b % 8)) & 1 == 1 { '1' } else { '0' })
         .collect()
+}
+
+/// A small line chart: min/max per pixel column, markers as vertical ticks.
+fn detail_plot(p: &DetailPlot, theme: &Theme) -> impl IntoElement {
+    let series = p.series.clone();
+    let markers: Vec<usize> = p.markers.iter().map(|m| m.0).collect();
+    let n = series.iter().map(|s| s.data.len()).max().unwrap_or(0);
+    let (lo, hi) = series
+        .iter()
+        .flat_map(|s| s.data.iter())
+        .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+    let (lo, hi) = if lo > hi { (-1.0, 1.0) } else if hi - lo < 1e-6 { (lo - 1.0, hi + 1.0) } else { (lo, hi) };
+    let chart = canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            window.paint_quad(fill(bounds, rgb(0x16161a)));
+            if n == 0 {
+                return;
+            }
+            let w = f32::from(bounds.size.width);
+            let h = f32::from(bounds.size.height) - 4.0;
+            let y_of = |v: f32| bounds.top() + px(2.0 + (hi - v) / (hi - lo) * h);
+            if lo < 0.0 && hi > 0.0 {
+                window.paint_quad(fill(Bounds { origin: point(bounds.left(), y_of(0.0)), size: size(bounds.size.width, px(1.0)) }, hsla(0.0, 0.0, 1.0, 0.12)));
+            }
+            for &m in &markers {
+                let x = bounds.left() + px(m as f32 / n as f32 * w);
+                window.paint_quad(fill(Bounds { origin: point(x, bounds.top()), size: size(px(1.0), bounds.size.height) }, hsla(0.0, 0.0, 1.0, 0.22)));
+            }
+            let cols = (w * window.scale_factor()) as usize;
+            for s in &series {
+                let color = crate::signal_viewer::role_color(s.role);
+                let d = &s.data;
+                if d.len() * 2 <= cols {
+                    let mut path = PathBuilder::stroke(px(1.2));
+                    for (i, &v) in d.iter().enumerate() {
+                        let pt = point(bounds.left() + px((i as f32 + 0.5) / d.len() as f32 * w), y_of(v));
+                        if i == 0 { path.move_to(pt) } else { path.line_to(pt) }
+                    }
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, color);
+                    }
+                } else {
+                    for c in 0..cols {
+                        let (a, b) = (c * d.len() / cols, ((c + 1) * d.len() / cols).max(c * d.len() / cols + 1).min(d.len()));
+                        let (mn, mx) = d[a..b].iter().fold((f32::MAX, f32::MIN), |(x, y), &v| (x.min(v), y.max(v)));
+                        let x = bounds.left() + px(c as f32 / window.scale_factor());
+                        let (t, btm) = (y_of(mx), y_of(mn));
+                        window.paint_quad(fill(Bounds { origin: point(x, t), size: size(px(1.0 / window.scale_factor()), (btm - t).max(px(1.0))) }, color));
+                    }
+                }
+            }
+        },
+    )
+    .w_full()
+    .h(px(110.));
+    let mut legend = h_flex().gap_3().text_xs();
+    for s in &p.series {
+        legend = legend.child(
+            h_flex()
+                .gap_1()
+                .child(div().w(px(10.)).h(px(3.)).bg(crate::signal_viewer::role_color(s.role)))
+                .child(div().text_color(theme.muted_foreground).child(s.label.clone())),
+        );
+    }
+    v_flex()
+        .gap_1()
+        .pt_2()
+        .child(h_flex().gap_3().child(div().text_xs().font_semibold().child(p.title.clone())).child(legend))
+        .child(chart)
+        .child(div().text_xs().text_color(theme.muted_foreground).child(format!("{} samples · range {lo:.0} … {hi:.0}", n)))
+}
+
+fn compact_table(t: &Table, theme: &Theme) -> impl IntoElement {
+    let cols = t.columns.len().max(1);
+    let mut grid = v_flex().border_1().border_color(theme.border).rounded_md().text_xs().font_family(theme.mono_font_family.clone());
+    let row = |cells: &[String], head: bool, odd: bool| {
+        let mut r = h_flex().when(head, |d| d.bg(theme.table_head).font_semibold()).when(odd, |d| d.bg(theme.table_even));
+        for (i, c) in cells.iter().enumerate() {
+            r = r.child(div().when(i == 0, |d| d.flex_1()).when(i > 0, |d| d.w(px(if cols > 3 { 64. } else { 84. }))).px_2().py(px(1.)).child(c.clone()));
+        }
+        r
+    };
+    grid = grid.child(row(&t.columns, true, false));
+    for (i, r) in t.rows.iter().enumerate() {
+        grid = grid.child(row(r, false, i % 2 == 1));
+    }
+    v_flex().gap_1().pt_2().child(div().text_xs().font_semibold().child(t.title.clone())).child(grid)
 }
 
 fn detail_grid(g: &DetailGrid, theme: &Theme) -> impl IntoElement {

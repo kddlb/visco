@@ -109,7 +109,7 @@ impl Sink {
         }
         // Map the last bit, not the end: the next data byte may sit after an RST marker.
         let (s, e) = (ecs.file_bit(start), ecs.file_bit(end - 1) + 1);
-        self.spans.push(BitSpan { start: s, len: (e - s).min(u16::MAX as u64) as u16, block, kind });
+        self.spans.push(BitSpan { start: s, len: (e - s).min(u32::MAX as u64) as u32, block, kind });
     }
 }
 

@@ -12,13 +12,23 @@ use gpui_kit::component::{
 use gpui_kit::*;
 use gpui_kit::base::{Disableable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
-use visco_core::{BlockId, BlockInfo, Codec, ParamSpec, ParamValue, Params, RgbImage, StageView, Trace};
+use visco_core::{BlockId, BlockInfo, Codec, Media, MediaKind, ParamSpec, ParamValue, Params, Pcm, RgbImage, StageView, Trace};
 
 use crate::{
+    audio::Audio,
     hexview,
     inspector::{self, InspectorTab},
+    signal_viewer::{self, SignalProps, SignalState},
     viewer::{self, ViewerProps, ViewerState},
 };
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PlayWhat {
+    /// The input audio (encode) or the decoded file (decode).
+    Original,
+    /// The current stage's signal (e.g. the residual), normalized to its peak.
+    Stage,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -39,11 +49,12 @@ pub struct Source {
     pub name: String,
     /// Original bytes when the file is in the codec's own format.
     pub codec_bytes: Option<Arc<[u8]>>,
-    /// Pixels for encoding.
-    pub rgb: Option<RgbImage>,
+    /// Pixels or samples for encoding.
+    pub media: Option<Media>,
 }
 
 pub struct Visco {
+    pub codecs: Vec<Arc<dyn Codec>>,
     pub codec: Arc<dyn Codec>,
     pub source: Option<Source>,
     pub load_error: Option<String>,
@@ -64,34 +75,20 @@ pub struct Visco {
     scan_slider: Option<Entity<SliderState>>,
     scan_ix: usize,
     pub viewer: Rc<RefCell<ViewerState>>,
+    pub signal: Rc<RefCell<SignalState>>,
     pub hex_scroll: UniformListScrollHandle,
     pub tab: InspectorTab,
     _subs: Vec<Subscription>,
+    param_subs: Vec<Subscription>,
+    audio: Rc<Audio>,
+    play_task: Option<Task<()>>,
 }
 
 impl Visco {
-    pub fn new(codec: Arc<dyn Codec>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let schema = codec.params_schema();
-        let params = Params::defaults(&schema);
-        let mut subs = vec![];
-        let mut sliders = vec![];
-        for spec in &schema {
-            if let ParamSpec::Int { key, min, max, default, .. } = *spec {
-                let s = cx.new(|_| {
-                    SliderState::new().min(min as f32).max(max as f32).step(1.0).default_value(default as f32)
-                });
-                subs.push(cx.subscribe_in(&s, window, move |this, _, ev: &SliderEvent, _, cx| {
-                    let SliderEvent::Change(v) = ev else { return };
-                    let v = v.start().round() as i64;
-                    if this.params.int(key, i64::MIN) != v {
-                        this.params.set(key, ParamValue::Int(v));
-                        this.schedule_encode(cx);
-                    }
-                }));
-                sliders.push((key, s));
-            }
-        }
-        Self {
+    pub fn new(codecs: Vec<Arc<dyn Codec>>, cx: &mut Context<Self>) -> Self {
+        let codec = codecs[0].clone();
+        let mut this = Self {
+            codecs,
             codec,
             source: None,
             load_error: None,
@@ -106,14 +103,51 @@ impl Visco {
             block_bytes: vec![],
             hover_byte: None,
             selected_byte: None,
-            params,
-            param_sliders: sliders,
+            params: Params::default(),
+            param_sliders: vec![],
             scan_slider: None,
             scan_ix: 0,
             viewer: Rc::new(RefCell::new(ViewerState::default())),
+            signal: Rc::new(RefCell::new(SignalState::default())),
             hex_scroll: UniformListScrollHandle::new(),
             tab: InspectorTab::Block,
-            _subs: subs,
+            _subs: vec![],
+            param_subs: vec![],
+            audio: Rc::new(Audio::new()),
+            play_task: None,
+        };
+        this.build_params(cx);
+        this
+    }
+
+    /// Switch codec, rebuilding its parameter controls.
+    fn set_codec(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if !Arc::ptr_eq(&self.codec, &self.codecs[ix]) {
+            self.codec = self.codecs[ix].clone();
+            self.build_params(cx);
+        }
+    }
+
+    fn build_params(&mut self, cx: &mut Context<Self>) {
+        let schema = self.codec.params_schema();
+        self.params = Params::defaults(&schema);
+        self.param_sliders.clear();
+        self.param_subs.clear();
+        for spec in &schema {
+            if let ParamSpec::Int { key, min, max, default, .. } = *spec {
+                let s = cx.new(|_| {
+                    SliderState::new().min(min as f32).max(max as f32).step(1.0).default_value(default as f32)
+                });
+                self.param_subs.push(cx.subscribe(&s, move |this, _, ev: &SliderEvent, cx| {
+                    let SliderEvent::Change(v) = ev else { return };
+                    let v = v.start().round() as i64;
+                    if this.params.int(key, i64::MIN) != v {
+                        this.params.set(key, ParamValue::Int(v));
+                        this.schedule_encode(cx);
+                    }
+                }));
+                self.param_sliders.push((key, s));
+            }
         }
     }
 
@@ -159,17 +193,20 @@ impl Visco {
     }
 
     pub fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let codec = self.codec.clone();
+        let codecs = self.codecs.clone();
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         self.load_error = None;
         self.loading = Some(cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move { load_source(&*codec, &path) }).await;
+            let result = cx.background_spawn(async move { load_source(&codecs, &path) }).await;
             this.update(cx, |this, cx| {
                 this.loading = None;
                 match result {
-                    Ok((codec_bytes, rgb)) => {
+                    Ok((ix, codec_bytes, media)) => {
+                        this.set_codec(ix, cx);
                         this.mode = if codec_bytes.is_some() { Mode::Decode } else { Mode::Encode };
-                        this.source = Some(Source { name, codec_bytes, rgb });
+                        this.source = Some(Source { name, codec_bytes, media });
+                        this.stop_audio(cx);
+                        this.signal.borrow_mut().reset();
                         this.decode = Slot::default();
                         this.encode = Slot::default();
                         this.stage_ix = [0, 0];
@@ -213,7 +250,10 @@ impl Visco {
     }
 
     pub fn schedule_encode(&mut self, cx: &mut Context<Self>) {
-        let Some(rgb) = self.source.as_ref().and_then(|s| s.rgb.clone()) else { return };
+        let Some(media) = self.source.as_ref().and_then(|s| s.media.clone()) else { return };
+        if media.kind() != self.codec.input_kind() {
+            return;
+        }
         let codec = self.codec.clone();
         let params = self.params.clone();
         let first = self.encode.trace.is_none();
@@ -226,7 +266,7 @@ impl Visco {
             if !first {
                 cx.background_executor().timer(Duration::from_millis(90)).await;
             }
-            let result = cx.background_spawn(async move { codec.encode(&rgb, &params) }).await;
+            let result = cx.background_spawn(async move { codec.encode(&media, &params) }).await;
             this.update(cx, |this, cx| this.finish(Mode::Encode, generation, result, cx)).ok();
         }));
         cx.notify();
@@ -378,6 +418,13 @@ impl Visco {
 
     /// Center the viewer on a block, switching to a plane that shows it if needed.
     fn focus_block(&mut self, id: BlockId) {
+        if let Some(StageView::Signals(sv)) = self.current_view() {
+            let found = sv.lanes.iter().filter_map(|l| l.blocks.as_ref()).find_map(|b| b.position_of(id).map(|i| b.ranges[i].0.clone()));
+            if let Some(r) = found {
+                self.signal.borrow_mut().focus(r.start, r.end, sv.len);
+            }
+            return;
+        }
         let Some(StageView::Planes(pvs)) = self.current_view() else { return };
         let found = std::iter::once(self.plane_ix)
             .chain(0..pvs.len())
@@ -401,7 +448,7 @@ impl Visco {
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let has_rgb = self.source.as_ref().is_some_and(|s| s.rgb.is_some());
+        let has_rgb = self.can_encode();
         let decode_label = if self.source.as_ref().is_some_and(|s| s.codec_bytes.is_none()) {
             "Decode (visco output)"
         } else {
@@ -441,6 +488,36 @@ impl Visco {
                         .when(self.mode != Mode::Encode, |b| b.ghost())
                         .on_click(cx.listener(|this, _, _, cx| this.set_mode(Mode::Encode, cx))),
                 )
+            })
+            .when(self.is_audio(), |el| {
+                let stage_is_signal = matches!(self.current_view(), Some(StageView::Signals(_)));
+                el.child(div().w(px(12.)))
+                    .child(
+                        Button::new("play-orig")
+                            .label(if self.mode == Mode::Encode { "▶ Input" } else { "▶ Play" })
+                            .small()
+                            .ghost()
+                            .tooltip("Play the visible range")
+                            .on_click(cx.listener(|this, _, _, cx| this.play(PlayWhat::Original, cx))),
+                    )
+                    .child(
+                        Button::new("play-stage")
+                            .label("▶ Stage signal")
+                            .small()
+                            .ghost()
+                            .disabled(!stage_is_signal)
+                            .tooltip("Play this stage's signal (e.g. the residual), normalized to its peak")
+                            .on_click(cx.listener(|this, _, _, cx| this.play(PlayWhat::Stage, cx))),
+                    )
+                    .child(
+                        Button::new("stop")
+                            .label("■")
+                            .small()
+                            .ghost()
+                            .disabled(!self.is_playing())
+                            .on_click(cx.listener(|this, _, _, cx| this.stop_audio(cx))),
+                    )
+                    .when_some(self.audio_error(), |el, e| el.child(div().text_xs().text_color(theme.danger).child(e)))
             })
             .child(
                 div()
@@ -509,7 +586,7 @@ impl Visco {
             } else if let Some(e) = &slot.error {
                 e.clone()
             } else if self.source.is_none() {
-                "Open a JPEG to step through decoding, or any image (PNG, JPEG, BMP) to encode it.\n\
+                "Open a JPEG or FLAC to step through decoding, or an image (PNG, BMP…) or WAV to encode it.\n\
                  Drag a file onto the window, or press ⌘O."
                     .into()
             } else {
@@ -583,6 +660,15 @@ impl Visco {
                     .into_any_element()
             }
             StageView::Sequence(_) => div().p_4().child("No snapshots.").into_any_element(),
+            StageView::Signals(sv) => {
+                let highlight = self.hover_span().and_then(|s| trace.bitstream.spans[s].block_id());
+                v_flex()
+                    .size_full()
+                    .child(h_flex().px_4().pb_2().gap_3().child(div().flex_1()).child(self.signal_controls(sv.len, cx)))
+                    .child(div().flex_1().min_h_0().child(self.make_signal_viewer(sv.clone(), highlight, &theme, cx)))
+                    .child(self.signal_readout(sv, &theme))
+                    .into_any_element()
+            }
             StageView::Tables(tables) => inspector::render_tables(tables, &theme).into_any_element(),
             StageView::Text(text) => div()
                 .id("stage-text")
@@ -597,6 +683,154 @@ impl Visco {
                 .into_any_element(),
         };
         v_flex().size_full().child(header).child(div().flex_1().min_h_0().child(body)).into_any_element()
+    }
+
+    pub fn is_audio(&self) -> bool {
+        self.trace().is_some_and(|t| matches!(t.output, Some(Media::Audio(_))))
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.play_task.is_some()
+    }
+
+    pub fn stop_audio(&mut self, cx: &mut Context<Self>) {
+        self.audio.stop();
+        self.play_task = None;
+        self.signal.borrow_mut().playhead = None;
+        cx.notify();
+    }
+
+    /// Play the visible range (or everything) of the chosen signal.
+    pub fn play(&mut self, what: PlayWhat, cx: &mut Context<Self>) {
+        let Some(t) = self.trace().cloned() else { return };
+        let to_f32 = |p: &Pcm| -> (Vec<Vec<f32>>, u32) {
+            let fs = (1u64 << (p.bits_per_sample.max(1) - 1)) as f32;
+            let n = p.channels.max(1) as usize;
+            ((0..n.min(2)).map(|c| p.samples.iter().skip(c).step_by(n).map(|&v| v as f32 / fs).collect()).collect(), p.sample_rate)
+        };
+        let (chans, rate): (Vec<Vec<f32>>, u32) = match what {
+            PlayWhat::Original => {
+                let pcm = match (self.mode, self.source.as_ref().and_then(|s| s.media.as_ref()), &t.output) {
+                    (Mode::Encode, Some(Media::Audio(p)), _) => p,
+                    (_, _, Some(Media::Audio(p))) => p,
+                    _ => return,
+                };
+                to_f32(pcm)
+            }
+            PlayWhat::Stage => {
+                let Some(StageView::Signals(sv)) = self.current_view() else { return };
+                let mut chans: Vec<Vec<f32>> =
+                    sv.lanes.iter().take(2).filter_map(|l| l.series.iter().rev().find(|s| s.role != visco_core::SeriesRole::Secondary).or(l.series.first())).map(|s| s.data.to_vec()).collect();
+                let peak = chans.iter().flatten().fold(1e-6f32, |m, v| m.max(v.abs()));
+                for c in &mut chans {
+                    for v in c.iter_mut() {
+                        *v *= 0.9 / peak;
+                    }
+                }
+                (chans, sv.sample_rate)
+            }
+        };
+        let Some(len) = chans.first().map(|c| c.len()) else { return };
+        let (s0, n) = self.signal.borrow().visible(len as u64);
+        let (a, b) = (s0.max(0.0) as usize, ((s0 + n).ceil() as usize).min(len));
+        if a >= b {
+            return;
+        }
+        let nch = chans.len();
+        let mut inter = Vec::with_capacity((b - a) * nch);
+        for i in a..b {
+            for c in &chans {
+                inter.push(c[i]);
+            }
+        }
+        self.audio.play(inter, nch as u16, rate, a as f64);
+        self.play_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(33)).await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        let pos = this.audio.position();
+                        this.signal.borrow_mut().playhead = pos;
+                        cx.notify();
+                        pos.is_some()
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.play_task = None;
+                this.signal.borrow_mut().playhead = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    pub fn audio_error(&self) -> Option<String> {
+        self.audio.error()
+    }
+
+    pub fn can_encode(&self) -> bool {
+        self.source.as_ref().and_then(|s| s.media.as_ref()).is_some_and(|m| m.kind() == self.codec.input_kind())
+    }
+
+    fn make_signal_viewer(&self, sv: visco_core::SignalView, highlight: Option<BlockId>, theme: &gpui_kit::component::Theme, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        let e2 = entity.clone();
+        signal_viewer::signal_viewer(SignalProps {
+            view: sv,
+            selected: self.selected_block,
+            highlight,
+            state: self.signal.clone(),
+            on_select: Rc::new(move |id, _, cx| entity.update(cx, |this, cx| this.select_block(id, true, cx))),
+            on_hover: Rc::new(move |_, cx| e2.update(cx, |_, cx| cx.notify())),
+            legend_text: theme.muted_foreground,
+        })
+        .into_any_element()
+    }
+
+    fn signal_controls(&self, len: u64, cx: &mut Context<Self>) -> AnyElement {
+        let fitting = self.signal.borrow().view.is_none();
+        h_flex()
+            .gap_1()
+            .child(Button::new("sig-fit").label("All").xsmall().when(fitting, |b| b.primary()).when(!fitting, |b| b.ghost()).on_click(cx.listener(|this, _, _, cx| {
+                this.signal.borrow_mut().reset();
+                cx.notify();
+            })))
+            .child(Button::new("sig-out").label("−").xsmall().ghost().on_click(cx.listener(move |this, _, _, cx| {
+                this.signal.borrow_mut().zoom_by(1.0 / 2.0, len);
+                cx.notify();
+            })))
+            .child(Button::new("sig-in").label("+").xsmall().ghost().on_click(cx.listener(move |this, _, _, cx| {
+                this.signal.borrow_mut().zoom_by(2.0, len);
+                cx.notify();
+            })))
+            .into_any_element()
+    }
+
+    fn signal_readout(&self, sv: &visco_core::SignalView, theme: &gpui_kit::component::Theme) -> AnyElement {
+        let st = self.signal.borrow();
+        let rate = sv.sample_rate.max(1) as f64;
+        let (s0, n) = st.visible(sv.len);
+        let range = format!("{:.3} s – {:.3} s ({:.0} samples)", s0 / rate, (s0 + n) / rate, n);
+        let text = match st.hover {
+            Some((lane, sample)) if (lane) < sv.lanes.len() && sample < sv.len => {
+                let l = &sv.lanes[lane];
+                let vals: Vec<String> = l.series.iter().map(|s| format!("{} {:+.5}", s.label, s.data[sample as usize])).collect();
+                let block = l.blocks.as_ref().and_then(|b| b.at(sample)).map(|i| {
+                    let b = l.blocks.as_ref().unwrap();
+                    let extra = b.categories.as_ref().map(|c| format!(" ({})", b.legend[c[i] as usize])).unwrap_or_default();
+                    let heat = b.heat.as_ref().map(|h| format!(" · {:.2} bits/sample", h[i])).unwrap_or_default();
+                    format!(" · block {}{extra}{heat}", b.ranges[i].1)
+                });
+                format!("{} · sample {sample} ({:.4} s) · {}{} · view {range}", l.label, sample as f64 / rate, vals.join(", "), block.unwrap_or_default())
+            }
+            _ => format!("{range} · drag to pan, ⌘-scroll or pinch to zoom, ⌥-scroll for gain, click a block to inspect"),
+        };
+        div().px_4().py_1().text_xs().text_color(theme.muted_foreground).font_family(theme.mono_font_family.clone()).child(text).into_any_element()
     }
 
     fn make_viewer(
@@ -714,27 +948,55 @@ impl Render for Visco {
     }
 }
 
-/// Read a file: codec-format files keep their bytes for decoding; any decodable image yields RGB.
-type Loaded = (Option<Arc<[u8]>>, Option<RgbImage>);
+/// (codec index, original bytes if the file is in that codec's format, media for encoding).
+type Loaded = (usize, Option<Arc<[u8]>>, Option<Media>);
 
-fn load_source(codec: &dyn Codec, path: &std::path::Path) -> Result<Loaded, String> {
+/// Read a file and pick a codec: a codec's own format is decoded (and its media kept for
+/// re-encoding); otherwise WAV becomes audio and anything `image` reads becomes an image.
+fn load_source(codecs: &[Arc<dyn Codec>], path: &std::path::Path) -> Result<Loaded, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    let is_codec = codec.extensions().contains(&ext.as_str())
-        || (codec.id() == "jpeg" && bytes.starts_with(&[0xFF, 0xD8]));
-    let bytes: Arc<[u8]> = bytes.into();
-    if is_codec {
-        // Our own decoder supplies the pixels for re-encoding (the image crate mis-decodes some files).
-        let rgb = visco_jpeg::decoder::decode(&bytes, visco_jpeg::decoder::DecodeOptions {
-            record_spans: false,
-            snapshots: false,
-            ..Default::default()
-        })
-        .ok()
-        .map(|d| RgbImage { width: d.frame.width as usize, height: d.frame.height as usize, data: d.rgb.into() });
-        return Ok((Some(bytes), rgb));
+    let by_kind = |k: MediaKind| codecs.iter().position(|c| c.input_kind() == k);
+    let own = codecs
+        .iter()
+        .position(|c| c.sniff(&bytes))
+        .or_else(|| codecs.iter().position(|c| c.extensions().contains(&ext.as_str())));
+    if let Some(ix) = own {
+        let bytes: Arc<[u8]> = bytes.into();
+        // Our own decoders supply the media for re-encoding.
+        let media = match codecs[ix].id() {
+            "jpeg" => visco_jpeg::decoder::decode(&bytes, visco_jpeg::decoder::DecodeOptions { record_spans: false, snapshots: false, ..Default::default() })
+                .ok()
+                .map(|d| Media::Image(RgbImage { width: d.frame.width as usize, height: d.frame.height as usize, data: d.rgb.into() })),
+            "flac" => visco_flac::decoder::decode(&bytes, visco_flac::decoder::DecodeOptions { record_spans: false, record_signals: false })
+                .ok()
+                .map(|d| Media::Audio(Pcm { sample_rate: d.info.sample_rate, bits_per_sample: d.info.bits_per_sample, channels: d.info.channels, samples: d.interleaved().into() })),
+            _ => None,
+        };
+        return Ok((ix, Some(bytes), media));
     }
-    let img = image::load_from_memory(&bytes).map_err(|e| format!("not a supported image: {e}"))?.to_rgb8();
+    if ext == "wav" || (bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE") {
+        let ix = by_kind(MediaKind::Audio).ok_or("no audio codec available")?;
+        return Ok((ix, None, Some(Media::Audio(read_wav(&bytes)?))));
+    }
+    let img = image::load_from_memory(&bytes).map_err(|e| format!("not a supported image or audio file: {e}"))?.to_rgb8();
     let (w, h) = (img.width() as usize, img.height() as usize);
-    Ok((None, Some(RgbImage { width: w, height: h, data: img.into_raw().into() })))
+    let ix = by_kind(MediaKind::Image).ok_or("no image codec available")?;
+    Ok((ix, None, Some(Media::Image(RgbImage { width: w, height: h, data: img.into_raw().into() }))))
+}
+
+fn read_wav(bytes: &[u8]) -> Result<Pcm, String> {
+    let mut r = hound::WavReader::new(bytes).map_err(|e| format!("WAV: {e}"))?;
+    let spec = r.spec();
+    let (bits, samples): (u8, Vec<i32>) = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            (spec.bits_per_sample as u8, r.samples::<i32>().collect::<Result<_, _>>().map_err(|e| format!("WAV: {e}"))?)
+        }
+        hound::SampleFormat::Float => {
+            // FLAC is integer-only: quantize float WAVs to 24-bit.
+            let s: Vec<f32> = r.samples::<f32>().collect::<Result<_, _>>().map_err(|e| format!("WAV: {e}"))?;
+            (24, s.iter().map(|&v| (v.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32).collect())
+        }
+    };
+    Ok(Pcm { sample_rate: spec.sample_rate, bits_per_sample: bits, channels: spec.channels as u8, samples: samples.into() })
 }

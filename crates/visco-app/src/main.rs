@@ -1,9 +1,11 @@
 //! visco: step through how codecs encode and decode, stage by stage.
 
 mod app;
+mod audio;
 mod hexview;
 mod inspector;
 mod raster;
+mod signal_viewer;
 mod viewer;
 
 use std::{path::PathBuf, sync::Arc};
@@ -35,7 +37,7 @@ fn main() {
         let initial = initial.clone();
         gpui_kit::open_window(options, cx, move |window, cx| {
             Theme::sync_system_appearance(Some(window), cx);
-            let view = cx.new(|cx| Visco::new(Arc::new(visco_jpeg::JpegCodec), window, cx));
+            let view = cx.new(|cx| Visco::new(vec![Arc::new(visco_jpeg::JpegCodec), Arc::new(visco_flac::FlacCodec)], cx));
             let weak = view.downgrade();
             cx.on_action(move |_: &Open, cx| {
                 weak.update(cx, |this, cx| this.prompt_open(cx)).ok();

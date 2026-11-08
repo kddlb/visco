@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use visco_core::{
-    BitSpan, Bitstream, BlockDetail, BlockGrid, BlockId, BlockInfo, DetailGrid, Plane, PlaneKind, PlaneView,
+    BitSpan, Bitstream, BlockDetail, Media, RgbImage, BlockGrid, BlockId, BlockInfo, DetailGrid, Plane, PlaneKind, PlaneView,
     Ramp, Segment, Snapshot, Stage, StageView, Table, Trace,
 };
 
@@ -58,7 +58,7 @@ impl BlockDetail for JpegBlocks {
 
     fn block_info(&self, id: BlockId, bs: &Bitstream) -> BlockInfo {
         let Some((ci, bx, by)) = self.locate(id) else {
-            return BlockInfo { title: format!("block {id}"), summary: vec![], grids: vec![], spans: vec![] };
+            return BlockInfo { title: format!("block {id}"), ..Default::default() };
         };
         let c = &self.comps[ci];
         let q = &c.coefs[by * c.blocks_w + bx];
@@ -103,7 +103,7 @@ impl BlockDetail for JpegBlocks {
         if padded {
             summary.push(("note".into(), "padding block outside the visible image".into()));
         }
-        BlockInfo { title: format!("{} block ({bx}, {by})", c.name), summary, grids, spans }
+        BlockInfo { title: format!("{} block ({bx}, {by})", c.name), summary, grids, spans, ..Default::default() }
     }
 }
 
@@ -405,6 +405,7 @@ pub fn encode_trace(e: Encoded, input_rgb: &[u8], roundtrip: &Decoded) -> Trace 
         bitstream: Bitstream { bytes: e.bytes.into(), segments: e.segments, spans: e.spans },
         blocks: Some(Arc::new(JpegBlocks { comps, encoder: true })),
         metrics,
+        output: Some(Media::Image(RgbImage { width: w, height: h, data: roundtrip.rgb.clone().into() })),
     }
 }
 
@@ -580,6 +581,7 @@ pub fn decode_trace(d: Decoded, bytes: Arc<[u8]>) -> Trace {
         bitstream: Bitstream { bytes, segments: d.segments, spans: d.spans },
         blocks: Some(Arc::new(JpegBlocks { comps, encoder: false })),
         metrics,
+        output: Some(Media::Image(RgbImage { width: w, height: h, data: d.rgb.into() })),
     }
 }
 

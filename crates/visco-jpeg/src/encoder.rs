@@ -220,7 +220,7 @@ fn encode_block(
 ) {
     let mut push = |start: u64, end: u64, kind: SpanKind| {
         if let Some(s) = spans.as_deref_mut() {
-            s.push(BitSpan { start, len: (end - start) as u16, block, kind });
+            s.push(BitSpan { start, len: (end - start) as u32, block, kind });
         }
     };
 

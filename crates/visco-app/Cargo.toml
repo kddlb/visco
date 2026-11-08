@@ -11,5 +11,8 @@ path = "src/main.rs"
 [dependencies]
 visco-core.workspace = true
 visco-jpeg.workspace = true
+visco-flac.workspace = true
+hound.workspace = true
+rodio.workspace = true
 gpui-kit.workspace = true
 image.workspace = true
