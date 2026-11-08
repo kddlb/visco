@@ -1,0 +1,13 @@
+[package]
+name = "visco-jpeg"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+visco-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+zune-jpeg.workspace = true
+image.workspace = true

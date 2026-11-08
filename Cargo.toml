@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/visco-core", "crates/visco-jpeg", "crates/visco-app"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+visco-core = { path = "crates/visco-core" }
+visco-jpeg = { path = "crates/visco-jpeg" }
+gpui-kit = "0.9"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+zune-jpeg = "0.4"
+thiserror = "2"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.visco-jpeg]
+opt-level = 3

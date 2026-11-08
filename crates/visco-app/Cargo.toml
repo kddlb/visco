@@ -1,0 +1,15 @@
+[package]
+name = "visco-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "visco"
+path = "src/main.rs"
+
+[dependencies]
+visco-core.workspace = true
+visco-jpeg.workspace = true
+gpui-kit.workspace = true
+image.workspace = true
